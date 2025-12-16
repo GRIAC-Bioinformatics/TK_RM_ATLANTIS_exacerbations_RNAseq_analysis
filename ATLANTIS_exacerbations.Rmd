@@ -1,0 +1,440 @@
+---
+title: "ATLANTIS_exacerbations"
+author: "Tatiana Karp, Rui Mercalo"
+date: "2025-07-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "~/Work/RP2/ATLANTIS")
+library(dplyr)
+library(edgeR)
+library(ggplot2)
+library(GSVA)
+library(pROC)
+library(biomaRt)
+library(ggrepel)
+library(stringr)
+
+```
+
+## 
+
+## Prepare the metadata
+
+```{r metadata, echo = FALSE}
+atlantis_exacerbations <- read.csv(file = './Exacerbations/ATLANTIS_master_table_exacerbation.csv')
+atlantis_exacerbations <- atlantis_exacerbations%>%
+  dplyr::select(-X)%>%
+  filter (QC_check == 'YES')%>%
+  mutate(gender = as.factor(gender),
+         smoking.status = as.factor(smoking.status),
+         exacerbation = as.factor (exacerbation),
+         time_to_exacerbation = as.numeric(time_to_exacerbation),
+         follow_up = as.numeric(follow_up),
+         Ex_freq = as.factor(if_else(NUM_EX_D>1, 'freq', 'not_freq')))
+
+# filter out samples with follow-up less than 250 days
+atlantis_exacerbations_decreased <- atlantis_exacerbations%>%
+  filter(follow_up >= 250)
+
+```
+
+## Add expression data and perform differentiall gene expression analysis 
+
+```{r DGE, echo=FALSE}
+# expression data
+expression.data <- read.csv('./Umi_dedup/20201107_ATLANTIS_raw_readcount_dedup_FINAL.csv', header =TRUE)%>%
+  tibble::column_to_rownames("Gene")%>%
+  dplyr::select(c(atlantis_exacerbations_decreased$GenomeScan_ID))%>%
+  as.matrix()
+
+all(colnames(expression.data) == atlantis_exacerbations_decreased$GenomeScan_ID)
+
+# DE yes/no exacerbations
+design <- model.matrix(~0 + exacerbation + age + gender + smoking.status, data = atlantis_exacerbations_decreased)
+
+DGEL_exac <- edgeR::DGEList(expression.data)
+keep <- edgeR::filterByExpr(DGEL_exac, design) 
+DGEL_exac <- DGEL_exac[keep, , keep.lib.sizes=FALSE]
+DGEL_exac <- edgeR::calcNormFactors(DGEL_exac, method = "TMM")
+
+TMM_expr <- cpm(DGEL_exac, normalized.lib.sizes = TRUE, log = TRUE) # save cpm normalized for later
+#write.csv(TMM_expr, "./Exacerbations/TMM_expr_atl.csv")
+
+
+# Fit the model
+DGEL_exac <- edgeR::estimateDisp(DGEL_exac, design)
+fit_exac <- edgeR::glmQLFit(DGEL_exac, design, legacy = T)
+contrasts <- limma::makeContrasts(EX_binary = exacerbationTRUE - exacerbationFALSE,
+                                  levels = design)
+qlf_exac   <- edgeR::glmQLFTest(fit_exac, contrast = contrasts[,"EX_binary"])
+summary(decideTests(qlf_exac))
+
+de.results.exac <- edgeR::topTags(
+  qlf_exac,
+  n=nrow(DGEL_exac))$table %>%
+  tibble::rownames_to_column("Gene") 
+
+# add gene names
+ensembl38 <- useEnsembl(biomart = "genes",
+                        dataset = "hsapiens_gene_ensembl",
+                        version = 101)
+
+dataprobes <- getBM(filters = "ensembl_gene_id", attributes = c(
+  "ensembl_gene_id",
+  "external_gene_name"),
+  values = as.character(de.results.exac$Gene),
+  mart = ensembl38
+)
+
+de.results.exac <- de.results.exac %>% 
+  dplyr::left_join(
+    y = dataprobes,
+    by = c("Gene" = "ensembl_gene_id")) 
+
+# write.csv(de.results.exac %>%
+#             mutate(across(where(is.numeric), ~ signif(.x, digits = 3))),
+#           "./Exacerbations/DE.genes.exac.yes.no.303.csv")
+```
+## Volcano plot 
+
+```{r volcano, echo=FALSE}
+# de.results.exac <- de.results.exac %>%
+#   mutate(names_to_plot = if_else(str_starts(external_gene_name, "AC"), Gene, external_gene_name))
+
+volcano <- ggplot(data = de.results.exac, aes(x=logFC, y=-log10(FDR))) +
+  geom_point(aes(color= ifelse((FDR < 0.05)&(logFC>0),'firebrick', ifelse((FDR < 0.05)&(logFC<0),'blue','gray')))) + 
+  theme_classic()+
+  geom_text_repel(aes(label=ifelse(((FDR < 0.05 ) & (abs(logFC)>1)) | (FDR < 0.000001),
+                                   (ifelse((!is.na(external_gene_name)), external_gene_name, '')), ''),
+                      lineheight=0.5, hjust= 0.5, vjust= 0.4),
+                  max.overlaps =50,
+                  direction = 'both',
+                  alpha = 0.6,
+                  box.padding=0.3,
+                  point.padding=0.5)+
+  xlab (expression (log[2]~fold~change))+
+  ylab (expression(-log[10]~FDR))+
+  scale_color_identity(name = '', breaks= c('firebrick', 'blue','gray') ,
+                       labels = c('higher in exacerbators',
+                                  'lower in exacerbators', 
+                                  'not significant'), guide = "legend")+
+  xlim(-2.5, 2.5) + 
+  theme(axis.text = element_text(size=15),
+        axis.title = element_text(size=15, face="plain"),
+        legend.position = "bottom",
+        panel.grid.major =  element_line(colour = "grey70", size = 0.1), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black", linewidth =0.6),
+        legend.text = element_text(size=12),
+        legend.key = element_rect(fill = "white"),
+        plot.title = element_text(hjust = 0.5, size = 15))
+
+saveRDS(volcano, "./Exacerbations/Exacerbations_DE_volcano.rds")
+
+png("./Exacerbations/Exacerbations_DE_volcano.png",
+    width = 1100, 
+    height = 1200,
+    res = 150)
+print(volcano)
+dev.off()
+```
+
+## Calculate GSVA score for DE genes
+
+```{r gsva, echo=FALSE}
+# define gene set - significant DE genes: 
+geneSet<- list(exacerbation_genes = de.results.exac[de.results.exac$FDR<0.05, 'Gene'])
+
+# define GSVA parameters: 
+# maxDiff - FALSE - to include both up and down genes
+# kcdf -Gaussian - for logCPM normalized genes
+gsvapar <- gsvaParam(as.matrix(TMM_expr), geneSet, maxDiff = FALSE, kcdf = "Gaussian")   
+gsva_score <- gsva(gsvapar, verbose = TRUE) %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column('Sample')
+
+## add gsva to clinical table 
+atlantis_exacerbations_decreased <- atlantis_exacerbations_decreased %>%
+  left_join(gsva_score, by = c("GenomeScan_ID" = "Sample")) %>%
+  rename("gsva_score_exacerbation_genes" = "exacerbation_genes")
+
+```
+
+## Prepare clinical data for exacerbation prediction
+
+```{r prepare_clinical_model, echo=FALSE}
+
+clinical_table <-  read.csv('./atlantis_patient_data.csv', header = TRUE, na.strings = c("","NA")) %>%
+  dplyr:: select(c('PT','GINA','LABEOSV', 'B_FEV1PNVG','acq6_score','NUM_EX'))
+clinical_table <- clinical_table[!duplicated(clinical_table$PT), ] %>% #choose data only from first visit
+  mutate (GINA = as.factor(GINA))
+
+
+model_table <- atlantis_exacerbations_decreased %>%
+  left_join(clinical_table, by = c('PT'='PT'))  %>%
+  dplyr::select(c(gender, smoking.status, GenomeScan_ID, GINA, LABEOSV, B_FEV1PNVG, Ex_freq,
+                  exacerbation, follow_up, NUM_EX_D, NUM_EX, acq6_score, gsva_score_exacerbation_genes)) %>%
+  mutate(ex_last_y = as.factor(if_else(NUM_EX>0, 'YES', 'NO'))) %>%
+  filter(!is.na(LABEOSV)) %>%  ## 2 removed with 0.00
+  filter(!is.na(B_FEV1PNVG)) %>% ## 3 removed with NAs
+  mutate(GINA_mild_severe = if_else(GINA %in% c('1','2','3'), 'mild', 'severe'))%>%
+  mutate(smoking = if_else (smoking.status %in% c('Non.smoker'), 'never', 'ex_cur_smoker'))
+
+table(model_table$exacerbation)
+
+```
+
+
+## Predict exacerbations only using clinical variables (clinical model)
+
+```{r clinical_model, echo=FALSE}
+
+model_clinical = glm(exacerbation ~ gender + smoking + acq6_score +  B_FEV1PNVG + ex_last_y + LABEOSV + GINA_mild_severe, data = model_table, family = binomial )
+summary(model_clinical)
+
+model_table_clinical <- model_table%>%
+  mutate(mod_clinical_l_pred = round(stats::predict(model_clinical, type = 'response')))
+
+actual <- (if_else(model_table_clinical$exacerbation == TRUE, 1,0))
+predicted_clinical <- model_table_clinical$mod_clinical_l_pred
+outcomes_clinical <- table(predicted_clinical, actual)
+
+# Model Accuracy
+prob_clinical = stats::predict(model_clinical, type = "response")
+roc_clinical = roc(model_table_clinical$exacerbation ~ prob_clinical, plot = TRUE, print.auc = TRUE)
+
+mean(predicted_clinical == actual)
+auc(roc_clinical)
+outcomes_clinical
+
+
+# Extract confusion matrix values
+TN_clinical <- outcomes_clinical[1,1]
+FP_clinical <- outcomes_clinical[2,1]
+FN_clinical <- outcomes_clinical[1,2]
+TP_clinical <- outcomes_clinical[2,2]
+
+# Sensitivity and Specificity
+sensitivity_clinical <- TP_clinical / (TP_clinical + FN_clinical)
+specificity_clinical <- TN_clinical / (TN_clinical + FP_clinical)
+
+# Balanced Accuracy -arithmetic mean of sensitivity and specificity
+balanced_accuracy_clinical <- (sensitivity_clinical + specificity_clinical) / 2
+balanced_accuracy_clinical # 0.6203569
+
+
+```
+
+
+```{r gsva_model, echo=FALSE}
+
+model_GSVA = glm(exacerbation ~ gender + smoking + acq6_score +  B_FEV1PNVG + ex_last_y + LABEOSV + GINA_mild_severe + gsva_score_exacerbation_genes, data = model_table, family = binomial)
+summary(model_GSVA)
+
+model_table_GSVA <- model_table%>%
+  mutate(mod_GSVA_l_pred = round(stats::predict(model_GSVA, type = 'response')))
+
+actual <- (if_else(model_table_GSVA$exacerbation == TRUE, 1,0))
+predicted_GSVA <- model_table_GSVA$mod_GSVA_l_pred
+outcomes_GSVA <- table(predicted_GSVA, actual)
+
+# Model Accuracy
+prob_GSVA = stats::predict(model_GSVA, type = "response")
+roc_GSVA = roc(model_table_GSVA$exacerbation ~ prob_GSVA, plot = TRUE, print.auc = TRUE)
+
+
+mean(predicted_GSVA == actual)
+auc(roc_GSVA)
+outcomes_GSVA
+
+
+# Extract confusion matrix values
+TN_GSVA <- outcomes_GSVA[1,1]
+FP_GSVA <- outcomes_GSVA[2,1]
+FN_GSVA <- outcomes_GSVA[1,2]
+TP_GSVA <- outcomes_GSVA[2,2]
+
+# Sensitivity and Specificity
+sensitivity_GSVA <- TP_GSVA / (TP_GSVA + FN_GSVA)
+specificity_GSVA <- TN_GSVA / (TN_GSVA + FP_GSVA)
+
+# Balanced Accuracy
+balanced_accuracy_GSVA <- (sensitivity_GSVA + specificity_GSVA) / 2
+balanced_accuracy_GSVA # 0.6676696
+
+```
+
+Compare clinical vs GSVA_model 
+
+```{r compare_model, echo=FALSE}
+
+# Compare the Optimal vs Clinical models in ATLANTIS 
+
+ATLANTIS_Clinical_vs_GSVA <- anova(model_clinical, model_GSVA, test = "Chisq") ## 
+ATLANTIS_Clinical_vs_GSVA # p-value = 0.001366 
+
+```
+
+Plot ROC for clinical and GSVA models
+
+```{r roc, echo=FALSE}
+
+# ROC objects
+ATLANTIS_roc_clinical <- roc(model_table$exacerbation, prob_clinical)
+ATLANTIS_roc_GSVA <- roc(model_table$exacerbation, prob_GSVA)
+
+# Combine into data frame for ggplot
+ATLANTIS_roc <- data.frame(
+  fpr = c(1 - ATLANTIS_roc_clinical$specificities, 1 - ATLANTIS_roc_GSVA$specificities),
+  tpr = c(ATLANTIS_roc_clinical$sensitivities, ATLANTIS_roc_GSVA$sensitivities),
+  model = rep(c("Clinical", "GSVA"), each = length(ATLANTIS_roc_clinical$specificities))
+)
+
+# Plot
+ggplot(ATLANTIS_roc, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curve: Clinical vs Clinical + GSVA (ATLANTIS)",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("blue", "red"))
+
+```
+Stepwise model building approach, incrementally adding covariates to assess their contribution to model performance (AUC, accuracy).
+Incremental model building
+
+```{r incremental_model echo=FALSE}
+
+# Function to fit model and compute metrics
+fit_model <- function(predictors, data, model_id) {
+  formula_str <- paste("exacerbation ~", paste(predictors, collapse = " + "))
+  model <- glm(as.formula(formula_str), data = data, family = binomial)
+
+  # Predicted probabilities and classification
+  prob <- stats::predict(model, type = "response")
+  pred_class <- round(prob)
+  actual <- if_else(data$exacerbation == TRUE, 1, 0)
+  #confusion matrix
+  outcomes <- table(pred_class, actual)
+  
+  # Default values
+  sensitivity <- 0
+  specificity <- 0
+
+  if (nrow(outcomes) == 2 && ncol(outcomes) == 2) {
+    TP <- outcomes["1", "1"]
+    FN <- outcomes["0", "1"]
+    TN <- outcomes["0", "0"]
+    FP <- outcomes["1", "0"]
+
+    if ((TP + FN) > 0) sensitivity <- TP / (TP + FN)
+    if ((TN + FP) > 0) specificity <- TN / (TN + FP)
+  } else {
+    message("Warning: Confusion matrix does not have both classes. Setting sensitivity and specificity to 0.")
+  }
+  
+  # ROC & AUC
+  roc_obj <- roc(data$exacerbation ~ prob, plot = TRUE, print.auc = TRUE, main = paste("Model", model_id))
+  auc_value <- auc(roc_obj)
+  acc <- mean(pred_class == actual)
+
+  # Return results
+  return(list(
+    model_id = model_id,
+    model = model,
+    formula = formula_str,
+    auc = auc_value,
+    accuracy = acc,
+    balanced_accuracy = (sensitivity + specificity) / 2,
+    sensitivity = sensitivity,
+    confusion = outcomes,
+    roc = roc_obj
+  ))
+}
+
+
+# List of predictors to add step-by-step
+predictor_sets <- list(
+  c("gender", "smoking"),
+  c("gender", "smoking", "acq6_score"),
+  c("gender", "smoking", "acq6_score", "B_FEV1PNVG"),
+  c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y"),
+  c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV"),
+  c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV", "GINA_mild_severe"),
+  c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV", "GINA_mild_severe", "gsva_score_exacerbation_genes")
+)
+
+# Run models
+model_results <- lapply(seq_along(predictor_sets), function(i) {
+  fit_model(predictors = predictor_sets[[i]], data = model_table, model_id = paste0("Model_", i))
+})
+
+# Create summary table
+
+model_summary <- model_results %>%
+  lapply(function(x) {
+    tibble(
+      Model = x$model_id,
+      Formula = x$formula,
+      Accuracy = round(x$accuracy, 3),
+      AUC = round(as.numeric(x$auc), 3),
+      Sensitivity = round(x$sensitivity, 3),
+      Balanced_accuracy = round(x$balanced_accuracy, 3)
+    )
+  }) %>%
+  bind_rows()
+
+```
+
+```{r}
+
+model_perf <- data.frame(
+  Model = c(
+    "Sex + Smoking",
+    "+ ACQ-6",
+    "+ FEV1 % pred",
+    "+ Exacerbation history",
+    "+ Blood eosinophils",
+    "+ GINA",
+    "+ GSVA"
+  ),
+  Sensitivity = (model_summary$Sensitivity*100)
+)
+
+# Factor to keep the order
+model_perf$Model <- factor(model_perf$Model, levels = model_perf$Model)
+
+# Custom labels with expression (subscript for FEV[1])
+custom_labels <- c(
+  "Sex + Smoking",
+  "+ ACQ-6",
+  expression("+ FEV"[1]*" % pred"),
+  "+ Exacerbation history",
+  "+ Blood eosinophils",
+  "+ GINA",
+  "+ GSVA"
+)
+
+
+ggplot(model_perf, aes(x = Model, y = Sensitivity)) +
+  geom_bar(stat = "identity", fill = "#2c7fb8") +
+  geom_text(aes(label = paste0(Sensitivity, "%")), vjust = -0.5, size = 4) +
+  labs(
+    title = "Change in sensitivity (True positive rate) with each additional variable",
+    x = "Model (Cumulative Addition of Predictors)",
+    y = "Sensitivity (%)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_x_discrete(labels = custom_labels) +
+  ylim(0, 45)
+
+```
+

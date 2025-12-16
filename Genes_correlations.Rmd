@@ -1,0 +1,112 @@
+---
+title: "Genes_correlations"
+author: "Tatiana Karp"
+date: "2025-12-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "~/Work/RP2/ATLANTIS")
+library(dplyr)
+library(edgeR)
+library(ggplot2)
+library(ggpubr)
+```
+
+
+## Prepare the metadata
+
+```{r metadata, echo = FALSE}
+atlantis_exacerbations <- read.csv(file = './Exacerbations/ATLANTIS_master_table_exacerbation.csv')
+atlantis_exacerbations <- atlantis_exacerbations%>%
+  dplyr::select(-X)%>%
+  filter (QC_check == 'YES')%>%
+  mutate(gender = as.factor(gender),
+         smoking.status = as.factor(smoking.status),
+         exacerbation = as.factor (exacerbation),
+         time_to_exacerbation = as.numeric(time_to_exacerbation),
+         follow_up = as.numeric(follow_up),
+         Ex_freq = as.factor(if_else(NUM_EX_D>1, 'freq', 'not_freq')))
+
+# filter out samples with follow-up less than 250 days
+atlantis_exacerbations_decreased <- atlantis_exacerbations%>%
+  filter(follow_up >= 250)
+
+```
+
+Add normalized expression and DE results
+
+```{r genes_cpms, echo=FALSE}
+log_cpm_expr <- read.csv("./Exacerbations/TMM_expr_atl.csv") %>%
+  tibble::column_to_rownames("X")
+de.results.exac <- read.csv("./Exacerbations/DE.genes.exac.yes.no.303.csv") 
+
+```
+
+Correlate genes of interest
+
+```{r genes_cor, echo=FALSE}
+
+plot_gene_correlation <- function(gene_x, gene_y) {
+  two_genes <- log_cpm_expr[c(gene_x, gene_y),] %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Sample") %>%
+  left_join(atlantis_exacerbations_decreased, by = c("Sample" = "GenomeScan_ID"))
+
+  cor.test(two_genes[,2],two_genes[,3])
+
+  x_sym <- rlang::sym(gene_x)
+  y_sym <- rlang::sym(gene_y)
+  
+  x_gene_name <-de.results.exac[de.results.exac$Gene == gene_x, "external_gene_name"]
+  y_gene_name <-de.results.exac[de.results.exac$Gene == gene_y, "external_gene_name"]
+
+  
+  scatter_plot <- ggplot(two_genes, aes(x = !!x_sym, y = !!y_sym)) +
+    geom_point(aes(color = exacerbation), size = 3) +
+    geom_smooth(method = "lm", se = TRUE, color = "red", linetype = "dashed") +
+    scale_color_manual(values = c(
+      "FALSE" = "#B7E5CD",
+      "TRUE"     = "#758A93" 
+    )) +
+    stat_cor(
+      method = "pearson") + # Use Pearson correlation
+    labs(
+      x = paste0(gene_x, " - ", x_gene_name),
+      y = paste0(gene_y, " - ", y_gene_name)
+    ) +
+    theme(axis.text = element_text(size=15),
+          axis.title = element_text(size=15, face="plain"),
+          legend.position = "bottom",
+          panel.grid.major =  element_line(colour = "grey70", size = 0.1), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), axis.line = element_line(colour = "black", linewidth =0.6),
+          legend.text = element_text(size = 12),
+          legend.key = element_rect(fill = "white"),
+          plot.title = element_text(hjust = 0.5, size = 15))  
+  png(paste0("./Exacerbations/cor_", x_gene_name, "_", y_gene_name, ".png"),
+    width = 1200, 
+    height = 1000,
+    res = 150)
+  print(scatter_plot)
+  dev.off()
+  return(scatter_plot)
+}
+
+# ENSG00000125538 (IL1B) and ENSG00000287937 (AC079753.2)
+
+plt <- plot_gene_correlation("ENSG00000125538", "ENSG00000287937")
+print(plt)
+
+# ENSG00000115607 (IL18RAP) and ENSG00000234389 (AC007278.1)
+
+plt <- plot_gene_correlation("ENSG00000115607", "ENSG00000234389")
+print(plt)
+
+# ENSG00000151726 (ACSL1) and ENSG00000213386 (AC022217.1)
+
+plt <- plot_gene_correlation("ENSG00000151726", "ENSG00000213386")
+print(plt)
+
+
+```
