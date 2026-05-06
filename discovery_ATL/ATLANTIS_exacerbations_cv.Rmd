@@ -1,0 +1,350 @@
+---
+title: "ATLANTIS_exacerbations"
+author: "Tatiana Karp, Rui Mercalo"
+date: "2025-07-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)
+library(edgeR)
+library(ggplot2)
+library(GSVA)
+library(pROC)
+library(biomaRt)
+library(ggrepel)
+library(stringr)
+library(here)
+
+source(here("config.R"))
+knitr::opts_knit$set(root.dir = ROOT_DIR)
+
+# Source the cross-validation helper functions
+source(here("R/cv_functions.R"))
+
+```
+
+## Prepare the metadata
+
+```{r metadata, echo=FALSE}
+atlantis_exacerbations <- read.csv(PATHS$metadata) %>%
+  dplyr::select(-X) %>%
+  filter(QC_check == 'YES') %>%
+  mutate(
+    gender                = as.factor(gender),
+    smoking.status        = as.factor(smoking.status),
+    exacerbation          = as.factor(exacerbation),
+    exacerbation_f = factor(if_else(exacerbation == TRUE, "Yes", "No"), levels = c("Yes", "No")),
+    time_to_exacerbation  = as.numeric(time_to_exacerbation),
+    follow_up             = as.numeric(follow_up),
+    Ex_freq               = as.factor(if_else(NUM_EX_D > 1, 'freq', 'not_freq'))
+  )
+
+# Filter out samples with follow-up < 250 days
+atlantis_exacerbations_decreased <- atlantis_exacerbations %>%
+  filter(follow_up >= 250)
+```
+
+## Add expression data and perform differential gene expression analysis
+
+```{r DGE, echo=FALSE}
+expression.data <- read.csv(PATHS$expression, header = TRUE) %>%
+  tibble::column_to_rownames("Gene") %>%
+  dplyr::select(all_of(atlantis_exacerbations_decreased$GenomeScan_ID)) %>%
+  as.matrix()
+
+all(colnames(expression.data) == atlantis_exacerbations_decreased$GenomeScan_ID)
+
+# DE: yes/no exacerbations
+design <- model.matrix(
+  ~0 + exacerbation + age + gender + smoking.status,
+  data = atlantis_exacerbations_decreased
+)
+
+DGEL_exac <- edgeR::DGEList(expression.data)
+keep <- edgeR::filterByExpr(DGEL_exac, design)
+DGEL_exac  <- DGEL_exac[keep, , keep.lib.sizes = FALSE]
+DGEL_exac  <- edgeR::calcNormFactors(DGEL_exac, method = "TMM")
+
+TMM_expr <- cpm(DGEL_exac, normalized.lib.sizes = TRUE, log = TRUE)
+
+DGEL_exac  <- edgeR::estimateDisp(DGEL_exac, design)
+fit_exac   <- edgeR::glmQLFit(DGEL_exac, design, legacy = TRUE)
+contrasts  <- limma::makeContrasts(
+  EX_binary = exacerbationTRUE - exacerbationFALSE,
+  levels    = design
+)
+qlf_exac <- edgeR::glmQLFTest(fit_exac, contrast = contrasts[, "EX_binary"])
+summary(decideTests(qlf_exac))
+
+de.results.exac <- edgeR::topTags(qlf_exac, n = nrow(DGEL_exac))$table %>%
+  tibble::rownames_to_column("Gene")
+```
+
+## Add gene names via biomaRt
+
+```{r gene_names, echo=FALSE}
+ensembl38  <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 101)
+dataprobes <- getBM(
+  filters    = "ensembl_gene_id",
+  attributes = c("ensembl_gene_id", "external_gene_name"),
+  values     = de.results.exac$Gene,
+  mart       = ensembl38
+)
+
+de.results.exac <- de.results.exac %>%
+  dplyr::left_join(dataprobes, by = c("Gene" = "ensembl_gene_id"))
+```
+
+## Volcano plot
+
+```{r volcano, echo=FALSE}
+volcano <- ggplot(data = de.results.exac, aes(x = logFC, y = -log10(FDR))) +
+  geom_point(aes(color = ifelse(
+    (FDR < 0.05) & (logFC > 0), 'firebrick',
+    ifelse((FDR < 0.05) & (logFC < 0), 'blue', 'gray')
+  ))) +
+  theme_classic() +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.5) +
+  geom_text_repel(
+    aes(label = ifelse(
+      ((FDR < 0.05) & (abs(logFC) > 1)) | (FDR < 0.000001),
+      ifelse(!is.na(external_gene_name), external_gene_name, ''), ''
+    )),
+    max.overlaps = 50, direction = 'both',
+    alpha = 0.6, box.padding = 0.3, point.padding = 0.5
+  ) +
+  xlab(expression(log[2] ~ fold ~ change)) +
+  ylab(expression(-log[10] ~ FDR)) +
+  scale_color_identity(
+    name   = '',
+    breaks = c('firebrick', 'blue', 'gray'),
+    labels = c('higher in exacerbators', 'lower in exacerbators', 'not significant'),
+    guide  = "legend"
+  ) +
+  xlim(-2.5, 2.5) +
+  theme(
+    axis.text        = element_text(size = 15),
+    axis.title       = element_text(size = 15, face = "plain"),
+    legend.position  = "bottom",
+    panel.grid.major = element_line(colour = "grey70", size = 0.1),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line        = element_line(colour = "black", linewidth = 0.6),
+    legend.text      = element_text(size = 12),
+    legend.key       = element_rect(fill = "white"),
+    plot.title       = element_text(hjust = 0.5, size = 15)
+  )
+
+saveRDS(volcano, OUTPUTS$volcano_rds)
+png(OUTPUTS$volcano_png, width = 1100, height = 1200, res = 150)
+print(volcano)
+dev.off()
+```
+
+## Calculate ssGSEA score for DE genes
+
+```{r ssGSEA, echo=FALSE}
+geneSet   <- list(exacerbation_genes = de.results.exac[de.results.exac$FDR < 0.05, 'Gene'])
+ssgseapar <- ssgseaParam(as.matrix(TMM_expr), geneSet, normalize = FALSE)
+
+gsva_score <- gsva(ssgseapar, verbose = TRUE) %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column('Sample')
+
+atlantis_exacerbations_decreased <- atlantis_exacerbations_decreased %>%
+  left_join(gsva_score, by = c("GenomeScan_ID" = "Sample")) %>%
+  rename("gsva_score_exacerbation_genes" = "exacerbation_genes")
+```
+
+## Prepare clinical data for exacerbation prediction
+
+```{r prepare_clinical_model, echo=FALSE}
+clinical_table <- clinical_table <- read.csv(PATHS$clinical, header = TRUE, na.strings = c("", "NA")) %>%
+  dplyr::select(c('PT', 'GINA', 'LABEOSV', 'B_FEV1PNVG', 'acq6_score', 'NUM_EX'))
+clinical_table <- clinical_table[!duplicated(clinical_table$PT), ] %>%
+  mutate(GINA = as.factor(GINA))
+
+model_table <- atlantis_exacerbations_decreased %>%
+  left_join(clinical_table, by = 'PT') %>%
+  dplyr::select(gender, smoking.status, GenomeScan_ID, GINA, LABEOSV,
+                B_FEV1PNVG, Ex_freq, exacerbation, exacerbation_f, follow_up,
+                NUM_EX_D, NUM_EX, acq6_score, gsva_score_exacerbation_genes) %>%
+  mutate(
+    ex_last_y      = as.factor(if_else(NUM_EX > 0, 'YES', 'NO')),
+    GINA_mild_severe = if_else(GINA %in% c('1','2','3'), 'mild', 'severe'),
+    smoking        = if_else(smoking.status %in% c('Non.smoker'), 'never', 'ex_cur_smoker')
+  ) %>%
+  filter(!is.na(LABEOSV), !is.na(B_FEV1PNVG))
+
+table(model_table$exacerbation)
+```
+
+## Logistic regression: in-sample model fit
+
+```{r clinical_model, echo=FALSE}
+model_clinical <- glm(
+  exacerbation ~ gender + smoking + acq6_score + B_FEV1PNVG +
+    ex_last_y + LABEOSV + GINA_mild_severe,
+  data   = model_table,
+  family = binomial
+)
+summary(model_clinical)
+
+prob_clinical <- stats::predict(model_clinical, type = "response")
+roc_clinical  <- roc(model_table$exacerbation ~ prob_clinical,
+                     plot = TRUE, print.auc = TRUE)
+auc(roc_clinical)
+```
+
+```{r gsva_model, echo=FALSE}
+model_GSVA <- glm(
+  exacerbation ~ gender + smoking + acq6_score + B_FEV1PNVG +
+    ex_last_y + LABEOSV + GINA_mild_severe + gsva_score_exacerbation_genes,
+  data   = model_table,
+  family = binomial
+)
+summary(model_GSVA)
+
+prob_GSVA <- stats::predict(model_GSVA, type = "response")
+roc_GSVA  <- roc(model_table$exacerbation ~ prob_GSVA,
+                 plot = TRUE, print.auc = TRUE)
+auc(roc_GSVA)
+```
+
+## Compare clinical vs GSVA model (likelihood-ratio test)
+
+```{r compare_model, echo=FALSE}
+ATLANTIS_Clinical_vs_GSVA <- anova(model_clinical, model_GSVA, test = "Chisq")
+ATLANTIS_Clinical_vs_GSVA
+```
+
+## ROC curves
+
+```{r roc, echo=FALSE}
+ATLANTIS_roc_clinical <- roc(model_table$exacerbation, prob_clinical)
+ATLANTIS_roc_GSVA     <- roc(model_table$exacerbation, prob_GSVA)
+
+roc_df <- data.frame(
+  fpr   = c(1 - ATLANTIS_roc_clinical$specificities,
+            1 - ATLANTIS_roc_GSVA$specificities),
+  tpr   = c(ATLANTIS_roc_clinical$sensitivities,
+            ATLANTIS_roc_GSVA$sensitivities),
+  model = rep(c("Clinical", "Clinical + GSVA"),
+              each = length(ATLANTIS_roc_clinical$specificities))
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curve: Clinical vs Clinical + GSVA (ATLANTIS)",
+    x     = "False Positive Rate (1 - Specificity)",
+    y     = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("blue", "red"))
+```
+
+## Incremental model building (stepwise covariate addition)
+
+```{r incremental_model, echo=FALSE}
+# Named list — goes directly into the Model column of the output table
+
+
+predictor_sets <- list(
+  "Sex + Smoking"          = c("gender", "smoking"),
+  "+ ACQ-6"                = c("gender", "smoking", "acq6_score"),
+  "+ FEV1"                 = c("gender", "smoking", "acq6_score", "B_FEV1PNVG"),
+  "+ Exacerbation history" = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y"),
+  "+ Blood eosinophils"    = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV"),
+  "+ GINA"                 = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV", "GINA_mild_severe"),
+  "+ GSVA"                 = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV", "GINA_mild_severe", "gsva_score_exacerbation_genes")
+)
+
+```
+
+## Cross-validation: repeated 5-fold CV (500 repeats)
+
+This section uses the functions defined in `cv_functions.R`.
+
+```{r cross_validation, echo=FALSE, cache=TRUE}
+
+# Set up caret trainControl 
+train_ctrl <- 
+  trainControl(
+    method          = "repeatedcv",
+    number          = 5,
+    repeats         = 500,
+    classProbs      = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  )
+
+```
+
+## Run incremental models with Cross-validation 
+
+```{r incremental_cv_train, echo=FALSE, cache=TRUE}
+# All 7 models in one parallel batch — cached after first knit
+incremental_cv_models <- run_incremental_cv_models(
+  predictor_sets = predictor_sets,
+  data           = model_table,
+  train_ctrl     = train_ctrl,
+  seed           = 42
+)
+```
+
+## Create a table with all the metrics from incremental models
+
+```{r incremental_cv_table, echo=FALSE}
+
+incremental_table <- build_incremental_cv_table(
+  predictor_sets = predictor_sets,
+  cv_models      = incremental_cv_models
+)
+
+print(incremental_table, n = Inf)
+
+```
+
+## Plot sensitivity by cumulative covariate addition
+
+```{r sensitivity_plot, echo=FALSE}
+model_perf <- incremental_table %>%
+  dplyr::select(Model, Sensitivity, Sensitivity_CI_low, Sensitivity_CI_high) %>%
+  mutate(
+    Model               = factor(Model, levels = Model),
+    Sensitivity         = Sensitivity * 100,
+    Sensitivity_CI_low  = Sensitivity_CI_low * 100,
+    Sensitivity_CI_high = Sensitivity_CI_high * 100
+  )
+
+custom_labels <- c(
+  "Sex + Smoking", "+ ACQ-6",
+  expression("+ FEV"[1] * " % pred"),
+  "+ Exacerbation history", "+ Blood eosinophils", "+ GINA", "+ GSVA"
+)
+
+ggplot(model_perf, aes(x = Model, y = Sensitivity)) +
+  geom_bar(stat = "identity", fill = "#2c7fb8", alpha = 0.85) +
+  geom_errorbar(
+    aes(ymin = Sensitivity_CI_low, ymax = Sensitivity_CI_high),
+    width  = 0.25,
+    colour = "gray30",
+    linewidth = 0.7
+  ) +
+  geom_text(aes(label = paste0(Sensitivity, "%")),
+            vjust = -0.5, size = 4) +
+  labs(
+    title = "CV Sensitivity (True Positive Rate) with each additional variable",
+    x     = "Model (Cumulative Addition of Predictors)",
+    y     = "Sensitivity (%)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_discrete(labels = custom_labels) +
+  ylim(0, 50)
+```
