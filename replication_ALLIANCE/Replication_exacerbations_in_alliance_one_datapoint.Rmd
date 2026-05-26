@@ -1,0 +1,234 @@
+---
+title: "Replication_exacerbations_in_alliance - One data per participant"
+author: "Tatiana Karp, Rui Mercalo"
+date: "2025-10-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(readxl)
+library(dplyr)
+library(pROC)
+library(here)
+
+source(here("config.R"))
+knitr::opts_knit$set(root.dir = ROOT_DIR)
+
+# Source the cross-validation helper functions
+source(here("R/cv_functions.R"))
+
+```
+
+## Load Alliance data
+### One datapoint per participant 
+
+```{r metadata, echo = FALSE}
+sample_list <- read_excel(PATHS$alliance_meta) 
+alliance_GSVA <- read.csv(PATHS$alliance_scores)
+# matching ids: pseudo.t_timepoint_1
+```
+
+## Prepare clinical data for exacerbation prediction
+
+```{r prepare_clinical_model, echo=FALSE}
+model_table <- sample_list %>%
+  left_join(alliance_GSVA, by = c("pseudo.t_timepoint_1" = "X")) %>%
+  dplyr::select(c(gender, smoking, GINA_mild_severe, LABEOSV, B_FEV1PNVG, ex_last_y,
+                  exacerbation, acq6_score, exacerbation_genes, TNFAIP6, ENSG00000287937)) %>%
+  filter(!is.na(LABEOSV)) %>%  ## 1 removed 
+  filter(!is.na(B_FEV1PNVG)) %>% ## 1 removed 
+  filter(!is.na(smoking)) %>% # 1 removed
+  filter(!(smoking == "NA")) %>% #one sample had character "NA"
+  filter(!is.na(ex_last_y)) %>%
+  mutate(exacerbation = if_else(exacerbation == "Yes", 1, 0)) %>%
+  mutate(exacerbation_f = factor(if_else(exacerbation == 1, "Yes", "No"), levels = c("Yes", "No")))
+
+
+table(model_table$exacerbation)
+```
+
+## Predict exacerbations only using clinical variables (clinical model)
+## Logistic regression: in-sample model fit
+
+```{r clinical_model, echo=FALSE}
+
+model_clinical = glm(exacerbation ~ gender + smoking + acq6_score +  B_FEV1PNVG + ex_last_y + LABEOSV + GINA_mild_severe, data = model_table, family = binomial )
+summary(model_clinical)
+
+coef_table <- summary(model_clinical)$coefficients %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+                              
+write.csv(coef_table, OUTPUTS$alliance_model_clinical)
+
+# model_table_clinical <- model_table%>%
+#   mutate(mod_clinical_l_pred = round(stats::predict(model_clinical, type = 'response')))
+# 
+# actual <- (if_else(model_table_clinical$exacerbation == TRUE, 1,0))
+# predicted_clinical <- model_table_clinical$mod_clinical_l_pred
+# outcomes_clinical <- table(predicted_clinical, actual)
+# 
+# # Model Accuracy
+# prob_clinical = stats::predict(model_clinical, type = "response")
+# roc_clinical = roc(model_table_clinical$exacerbation ~ prob_clinical, plot = TRUE, print.auc = TRUE)
+# 
+# mean(predicted_clinical == actual) # accuracy
+# auc(roc_clinical)
+# outcomes_clinical
+# 
+# # Extract confusion matrix values
+# TN_clinical <- outcomes_clinical[1,1]
+# FP_clinical <- outcomes_clinical[2,1]
+# FN_clinical <- outcomes_clinical[1,2]
+# TP_clinical <- outcomes_clinical[2,2]
+# 
+# # Sensitivity and Specificity
+# sensitivity_clinical <- TP_clinical / (TP_clinical + FN_clinical)
+# specificity_clinical <- TN_clinical / (TN_clinical + FP_clinical)
+# 
+# # Balanced Accuracy -arithmetic mean of sensitivity and specificity
+# balanced_accuracy_clinical <- (sensitivity_clinical + specificity_clinical) / 2
+# balanced_accuracy_clinical # 0.5652443
+
+```
+
+## Logistic regression with GSVA score: in-sample model fit
+
+```{r gsva_model, echo=FALSE}
+
+model_GSVA = glm(exacerbation ~ gender + smoking + acq6_score +  B_FEV1PNVG + ex_last_y + LABEOSV + GINA_mild_severe + exacerbation_genes, data = model_table, family = binomial)
+summary(model_GSVA)
+
+coef_table <- summary(model_GSVA)$coefficients %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+                              
+write.csv(coef_table, OUTPUTS$alliance_model_score)
+# 
+# model_table_GSVA <- model_table%>%
+#   mutate(mod_GSVA_l_pred = round(stats::predict(model_GSVA, type = 'response')))
+# 
+# actual <- (if_else(model_table_GSVA$exacerbation == TRUE, 1,0))
+# predicted_GSVA <- model_table_GSVA$mod_GSVA_l_pred
+# outcomes_GSVA <- table(predicted_GSVA, actual)
+# 
+# # Model Accuracy
+# prob_GSVA = stats::predict(model_GSVA, type = "response")
+# roc_GSVA = roc(model_table_GSVA$exacerbation ~ prob_GSVA, plot = TRUE, print.auc = TRUE)
+# 
+# 
+# mean(predicted_GSVA == actual)
+# auc(roc_GSVA)
+# outcomes_GSVA
+# 
+# 
+# # Extract confusion matrix values
+# TN_GSVA <- outcomes_GSVA[1,1]
+# FP_GSVA <- outcomes_GSVA[2,1]
+# FN_GSVA <- outcomes_GSVA[1,2]
+# TP_GSVA <- outcomes_GSVA[2,2]
+# 
+# # Sensitivity and Specificity
+# sensitivity_GSVA <- TP_GSVA / (TP_GSVA + FN_GSVA)
+# specificity_GSVA <- TN_GSVA / (TN_GSVA + FP_GSVA)
+# 
+# # Balanced Accuracy
+# balanced_accuracy_GSVA <- (sensitivity_GSVA + specificity_GSVA) / 2
+# balanced_accuracy_GSVA #  0.6258503
+```
+
+Compare clinical vs GSVA_model 
+
+```{r compare_model, echo=FALSE}
+
+# Compare the Optimal vs Clinical models in ATLANTIS 
+
+Alliance_Clinical_vs_GSVA <- anova(model_clinical, model_GSVA, test = "Chisq") 
+Alliance_Clinical_vs_GSVA # p-value = 0.0528
+
+```
+## Incremental model building (stepwise covariate addition)
+
+```{r incremental_model, echo=FALSE}
+# Named list — goes directly into the Model column of the output table
+
+
+predictor_sets <- list(
+  "Sex + Smoking"          = c("gender", "smoking"),
+  "+ ACQ-6"                = c("gender", "smoking", "acq6_score"),
+  "+ FEV1"                 = c("gender", "smoking", "acq6_score", "B_FEV1PNVG"),
+  "+ Exacerbation history" = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y"),
+  "+ Blood eosinophils"    = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV"),
+  "+ GINA"                 = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV", "GINA_mild_severe"),
+  "+ GSVA"                 = c("gender", "smoking", "acq6_score", "B_FEV1PNVG", "ex_last_y", "LABEOSV", "GINA_mild_severe", "exacerbation_genes")
+)
+
+```
+
+## Cross-validation: repeated 5-fold CV (500 repeats)
+
+This section uses the functions defined in `cv_functions.R`.
+
+```{r cross_validation, echo=FALSE, cache=TRUE}
+
+# Set up caret trainControl 
+train_ctrl <- 
+  trainControl(
+    method          = "repeatedcv",
+    number          = 5,
+    repeats         = 500,
+    classProbs      = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  )
+
+```
+
+## Run incremental models with Cross-validation 
+
+```{r incremental_cv_train, echo=FALSE, cache=TRUE}
+# All 7 models in one parallel batch — cached after first knit
+incremental_cv_models <- run_incremental_cv_models(
+  predictor_sets = predictor_sets,
+  data           = model_table,
+  train_ctrl     = train_ctrl,
+  seed           = 42
+)
+```
+
+## Create a table with all the metrics from incremental models
+
+```{r incremental_cv_table, echo=FALSE}
+
+incremental_table <- build_incremental_cv_table(
+  predictor_sets = predictor_sets,
+  cv_models      = incremental_cv_models
+)
+
+print(incremental_table, n = Inf)
+write.csv(incremental_table, OUTPUTS$alliance_incremental_table)
+
+```
+
+
+## Add two genes to the model
+
+
+```{r gsva_model, echo=FALSE}
+model_twogenes = glm(exacerbation ~ gender + smoking + acq6_score +  B_FEV1PNVG + ex_last_y + LABEOSV + GINA_mild_severe + TNFAIP6 + ENSG00000287937, data = model_table, family = binomial)
+summary(model_twogenes)
+
+coef_table <- summary(model_twogenes)$coefficients %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+                              
+write.csv(coef_table, OUTPUTS$alliance_2genes_model)
+
+```
+
