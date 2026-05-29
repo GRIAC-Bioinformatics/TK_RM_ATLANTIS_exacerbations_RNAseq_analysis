@@ -1,7 +1,7 @@
 ---
-title: "ATLANTIS_exacerbations"
-author: "Tatiana Karp, Rui Mercalo"
-date: "2025-07-15"
+title: "ATLANTIS_exacerbations_cv_with_R520"
+author: "Tatiana Karp"
+date: "2026-05-26"
 output: html_document
 ---
 
@@ -163,7 +163,7 @@ atlantis_exacerbations_decreased <- atlantis_exacerbations_decreased %>%
 
 ```{r prepare_clinical_model, echo=FALSE}
 clinical_table <- read.csv(PATHS$clinical, header = TRUE, na.strings = c("", "NA")) %>%
-  dplyr::select(c('PT', 'GINA', 'LABEOSV', 'B_FEV1PNVG', 'acq6_score', 'NUM_EX'))
+  dplyr::select(c('PT', 'GINA', 'LABEOSV', 'B_FEV1PNVG', 'acq6_score', 'NUM_EX', 'B_R520PNVR'))
 clinical_table <- clinical_table[!duplicated(clinical_table$PT), ] %>%
   mutate(GINA = as.factor(GINA))
 
@@ -171,13 +171,13 @@ model_table <- atlantis_exacerbations_decreased %>%
   left_join(clinical_table, by = 'PT') %>%
   dplyr::select(gender, smoking.status, GenomeScan_ID, GINA, LABEOSV,
                 B_FEV1PNVG, Ex_freq, exacerbation, exacerbation_f, follow_up,
-                NUM_EX_D, NUM_EX, acq6_score, gsva_score_exacerbation_genes) %>%
+                NUM_EX_D, NUM_EX, acq6_score, B_R520PNVR, gsva_score_exacerbation_genes) %>%
   mutate(
     ex_last_y      = as.factor(if_else(NUM_EX > 0, 'YES', 'NO')),
     GINA_mild_severe = if_else(GINA %in% c('1','2','3'), 'mild', 'severe'),
     smoking        = if_else(smoking.status %in% c('Non.smoker'), 'never', 'ex_cur_smoker')
   ) %>%
-  filter(!is.na(LABEOSV), !is.na(B_FEV1PNVG))
+  filter(!is.na(LABEOSV), !is.na(B_FEV1PNVG), !is.na(B_R520PNVR))
 
 table(model_table$exacerbation)
 ```
@@ -187,7 +187,7 @@ table(model_table$exacerbation)
 ```{r clinical_model, echo=FALSE}
 model_clinical <- glm(
   exacerbation ~ gender + smoking + acq6_score + B_FEV1PNVG +
-    ex_last_y + LABEOSV + GINA_mild_severe,
+    ex_last_y + LABEOSV + GINA_mild_severe + B_R520PNVR,
   data   = model_table,
   family = binomial
 )
@@ -204,7 +204,7 @@ auc(roc_clinical)
 ```{r gsva_model, echo=FALSE}
 model_GSVA <- glm(
   exacerbation ~ gender + smoking + acq6_score + B_FEV1PNVG +
-    ex_last_y + LABEOSV + GINA_mild_severe + gsva_score_exacerbation_genes,
+    ex_last_y + LABEOSV + GINA_mild_severe + B_R520PNVR + gsva_score_exacerbation_genes,
   data   = model_table,
   family = binomial
 )
@@ -311,60 +311,4 @@ incremental_table <- build_incremental_cv_table(
 print(incremental_table, n = Inf)
 write.csv(incremental_table, OUTPUTS$incremental_table)
 ```
-
-## Testing the delta AUC
-
-```{r compare_clinical_gsva, echo=FALSE}
-# calculate average ROC per repeat (since within )
-avg_by_repeat <- function(caret_model) {
-  caret_model$resample %>%
-    mutate(Repeat = str_extract(Resample, "Rep\\d+")) %>%
-    group_by(Repeat) %>%
-    summarise(ROC = mean(ROC)) %>%
-    pull(ROC)
-}
-
-aucs_clinical <- avg_by_repeat(incremental_cv_models[["+ GINA"]])
-aucs_gsva     <- avg_by_repeat(incremental_cv_models[["+ GSVA"]])
-
-delta <-aucs_gsva - aucs_clinical
-
-test_result <- wilcox.test(delta, mu = 0)
-median(delta)
-quantile(delta, c(.025,.975))
-
-
-```
-
-## Prepare clinical data with small airways parameter for exacerbation prediction
-
-```{r prepare_clinical_model, echo=FALSE}
-clinical_table_sa <- read.csv(PATHS$clinical, header = TRUE, na.strings = c("", "NA")) %>%
-  dplyr::select(c('PT', 'GINA', 'LABEOSV', 'B_FEV1PNVG', 'acq6_score', 'NUM_EX', 'B_R520PNVR'))
-clinical_table_sa <- clinical_table_sa[!duplicated(clinical_table_sa$PT), ] %>%
-  mutate(GINA = as.factor(GINA))
-
-model_table_sa <- atlantis_exacerbations_decreased %>%
-  left_join(clinical_table_sa, by = 'PT') %>%
-  dplyr::select(gender, smoking.status, GenomeScan_ID, GINA, LABEOSV,
-                B_FEV1PNVG, Ex_freq, exacerbation, exacerbation_f, follow_up,
-                NUM_EX_D, NUM_EX, acq6_score, B_R520PNVR) %>%
-  mutate(
-    ex_last_y      = as.factor(if_else(NUM_EX > 0, 'YES', 'NO')),
-    GINA_mild_severe = if_else(GINA %in% c('1','2','3'), 'mild', 'severe'),
-    smoking        = if_else(smoking.status %in% c('Non.smoker'), 'never', 'ex_cur_smoker')
-  ) %>%
-  filter(!is.na(LABEOSV), !is.na(B_FEV1PNVG), !is.na(B_R520PNVR))
-
-table(model_table_sa$exacerbation)
-
-model_clinical_sa <- glm(
-  exacerbation ~ gender + smoking + acq6_score + B_FEV1PNVG +
-    ex_last_y + LABEOSV + GINA_mild_severe + B_R520PNVR,
-  data   = model_table_sa,
-  family = binomial
-)
-summary(model_clinical_sa)
-```
-
 
