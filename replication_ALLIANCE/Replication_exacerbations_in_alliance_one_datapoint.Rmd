@@ -232,3 +232,27 @@ write.csv(coef_table, OUTPUTS$alliance_2genes_model)
 
 ```
 
+## Testing the delta AUC
+
+```{r compare_clinical_gsva, echo=FALSE}
+# calculate average ROC per repeat (since within )
+avg_by_repeat <- function(caret_model) {
+  caret_model$resample %>%
+    mutate(Repeat = str_extract(Resample, "Rep\\d+")) %>%
+    group_by(Repeat) %>%
+    summarise(ROC = mean(ROC)) %>%
+    pull(ROC)
+}
+
+aucs_clinical <- avg_by_repeat(incremental_cv_models[["+ GINA"]])
+aucs_gsva     <- avg_by_repeat(incremental_cv_models[["+ GSVA"]])
+
+delta <-aucs_gsva - aucs_clinical
+
+test_result <- wilcox.test(delta, mu = 0)
+print(test_result)
+median(delta)
+quantile(delta, c(.025,.975))
+
+
+```
